@@ -15,7 +15,8 @@
           "identifier": "browser-open",
           "description": "Permit the WebUI to Open Links in the systems default browser",
           "windows": [
-            "main"
+            "main",
+            "link-popout"
           ],
           "local": true,
           "remote": {
@@ -36,7 +37,10 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "GoXLR Utility",
+        "dragDropEnabled": false,
+        "transparent": true,
+        "decorations": false,
+        "title": "GoXLR Excellent",
         "width": 1300,
         "height": 910
       }

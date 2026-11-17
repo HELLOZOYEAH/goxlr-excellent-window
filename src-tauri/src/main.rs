@@ -17,10 +17,13 @@ use std::io::ErrorKind;
 use crate::ipc::Socket;
 use interprocess::local_socket::traits::tokio::Stream;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tungstenite::{connect, Message};
 
 static WINDOW_NAME: &str = "main";
+static POPOUT_WINDOW_NAME: &str = "link-popout";
+static POPOUT_SIZE: (f64, f64) = (700.0, 230.0);
 static READY_EVENT_NAME: &str = "READY";
 static SHOW_EVENT_NAME: &str = "si-event";
 static HIDE_EVENT_NAME: &str = "HIDE-UI";
@@ -69,6 +72,15 @@ async fn run_application() -> Result<(), String> {
         }))
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            device_view,
+            link_popout,
+            window_close,
+            window_minimize,
+            window_toggle_maximize,
+            window_hide,
+            window_drag
+        ])
         .setup(|app| {
             let global_window = app.handle().clone();
             app.listen_any(SHOW_EVENT_NAME, move |_| {
@@ -126,6 +138,10 @@ async fn run_application() -> Result<(), String> {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Only the main window goes to the tray
+                if window.label() != WINDOW_NAME {
+                    return;
+                }
                 window.hide().unwrap();
                 api.prevent_close();
                 #[cfg(target_os = "macos")]
@@ -145,6 +161,180 @@ async fn run_application() -> Result<(), String> {
         .expect("error running tauri app");
 
     Ok(())
+}
+
+// Device view (goxlr-ui util/appWindow.js): the window shrinks to just the device, with a
+// see-through background (the window is created transparent in tauri.conf.json), and grows back
+// into the full app when the page asks. The window never has the Windows frame: the page draws its
+// own minimise / maximise / close buttons and drags the window by its header.
+//
+// Growing centres the app on the middle of the device (`anchor`, CSS pixels inside the window),
+// fitted to the screen it is on. Shrinking back returns to where the device was, unless the app
+// has been moved since; then the device appears in the middle of the app.
+#[tauri::command]
+fn device_view(
+    window: tauri::WebviewWindow,
+    on: bool,
+    width: f64,
+    height: f64,
+    anchor: Option<(f64, f64)>,
+) -> Result<(), String> {
+    let err = |e: tauri::Error| e.to_string();
+    window.set_decorations(false).map_err(err)?;
+    if on && window.is_maximized().unwrap_or(false) {
+        window.unmaximize().map_err(err)?;
+    }
+    window.set_shadow(!on).map_err(err)?;
+    window.set_resizable(!on).map_err(err)?;
+
+    let at = window.outer_position().map_err(err)?;
+    let now = window.outer_size().map_err(err)?;
+    let scale = window.scale_factor().map_err(err)?;
+    let (centre_x, centre_y) = match anchor {
+        Some((x, y)) => (at.x + (x * scale) as i32, at.y + (y * scale) as i32),
+        None => (at.x + now.width as i32 / 2, at.y + now.height as i32 / 2),
+    };
+    let area = work_area(&window, centre_x, centre_y);
+    let (w, h) = ((width * scale) as i32, (height * scale) as i32);
+    let mut target = fit_on_screen(centre_x, centre_y, w, h, area);
+
+    let mut device_spot = DEVICE_SPOT.lock().unwrap();
+    if on {
+        if let Some((device, app)) = *device_spot {
+            if app == (at.x, at.y) {
+                target = (device.0, device.1, w, h);
+            }
+        }
+    } else {
+        *device_spot = Some(((at.x, at.y), (target.0, target.1)));
+    }
+    place_window(&window, target).map_err(err)
+}
+
+// Where the device was, and where the app opened from there: (device x, y), (app x, y)
+static DEVICE_SPOT: Mutex<Option<((i32, i32), (i32, i32))>> = Mutex::new(None);
+
+// A window this big, as close to centred on (x, y) as `area` allows: (x, y, width, height).
+// Everything is in physical pixels; `area` is left, top, right, bottom.
+fn fit_on_screen(x: i32, y: i32, width: i32, height: i32, area: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let (left, top, right, bottom) = area;
+    let width = width.min(right - left);
+    let height = height.min(bottom - top);
+    (
+        (x - width / 2).clamp(left, right - width),
+        (y - height / 2).clamp(top, bottom - height),
+        width,
+        height,
+    )
+}
+
+// The usable part of the screen under this point (no taskbar)
+#[cfg(target_os = "windows")]
+fn work_area(_window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32, i32, i32, i32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let _ = GetMonitorInfoW(monitor, &mut info);
+    }
+    let r = info.rcWork;
+    (r.left, r.top, r.right, r.bottom)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn work_area(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32, i32, i32, i32) {
+    let monitor = window
+        .monitor_from_point(x as f64, y as f64)
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten());
+    match monitor {
+        Some(m) => (
+            m.position().x,
+            m.position().y,
+            m.position().x + m.size().width as i32,
+            m.position().y + m.size().height as i32,
+        ),
+        None => (i32::MIN / 2, i32::MIN / 2, i32::MAX / 2, i32::MAX / 2),
+    }
+}
+
+// Moves and resizes in one step on Windows, so the page doesn't jump between the two
+#[cfg(target_os = "windows")]
+fn place_window(window: &tauri::WebviewWindow, (x, y, w, h): (i32, i32, i32, i32)) -> tauri::Result<()> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+
+    let hwnd = HWND(window.hwnd()?.0);
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn place_window(window: &tauri::WebviewWindow, (x, y, w, h): (i32, i32, i32, i32)) -> tauri::Result<()> {
+    window.set_position(tauri::PhysicalPosition::new(x, y))?;
+    window.set_size(tauri::PhysicalSize::new(w as u32, h as u32))
+}
+
+// The GoXLR Link pop-out: its own window with no frame, like the device view. Async because
+// Windows can deadlock when a window is created from a command on the main thread.
+#[tauri::command]
+async fn link_popout(app: AppHandle, window: tauri::WebviewWindow, url: String) -> Result<(), String> {
+    if let Some(open) = app.get_webview_window(POPOUT_WINDOW_NAME) {
+        let _ = open.show();
+        let _ = open.unminimize();
+        return open.set_focus().map_err(|e| e.to_string());
+    }
+    let page = window.url().map_err(|e| e.to_string())?;
+    let url = page.join(&url).map_err(|e| e.to_string())?;
+    tauri::WebviewWindowBuilder::new(&app, POPOUT_WINDOW_NAME, tauri::WebviewUrl::External(url))
+        .title("GoXLR Link")
+        .inner_size(POPOUT_SIZE.0, POPOUT_SIZE.1)
+        .center()
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .resizable(false)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+// Really closes the window (the main window's close button only hides it)
+#[tauri::command]
+fn window_close(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.close().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_minimize(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.minimize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_toggle_maximize(window: tauri::WebviewWindow) -> Result<(), String> {
+    let maximized = window.is_maximized().map_err(|e| e.to_string())?;
+    if maximized { window.unmaximize() } else { window.maximize() }.map_err(|e| e.to_string())
+}
+
+// Like the close button: the app keeps running in the tray
+#[tauri::command]
+fn window_hide(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(|e| e.to_string())
 }
 
 async fn goxlr_preflight() -> Result<String, String> {
@@ -546,6 +736,34 @@ fn show_option(title: String, message: String) -> Result<(), ()> {
             return Ok(());
         }
         Err(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_on_screen;
+
+    const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
+
+    #[test]
+    fn centres_on_the_device_when_there_is_room() {
+        assert_eq!(fit_on_screen(960, 520, 1300, 910, SCREEN), (310, 65, 1300, 910));
+    }
+
+    #[test]
+    fn stays_on_screen_next_to_an_edge() {
+        assert_eq!(fit_on_screen(1800, 900, 1300, 910, SCREEN), (620, 130, 1300, 910));
+        assert_eq!(fit_on_screen(40, 20, 1300, 910, SCREEN), (0, 0, 1300, 910));
+    }
+
+    #[test]
+    fn shrinks_to_fit_a_small_screen() {
+        assert_eq!(fit_on_screen(400, 300, 1300, 910, (0, 0, 1280, 680)), (0, 0, 1280, 680));
+    }
+
+    #[test]
+    fn works_on_a_screen_left_of_the_main_one() {
+        assert_eq!(fit_on_screen(-100, 500, 1300, 910, (-1920, 0, 0, 1040)), (-1300, 45, 1300, 910));
     }
 }
 
